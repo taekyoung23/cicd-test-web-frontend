@@ -2,10 +2,43 @@ def slackDisplay(value) {
     return value == null || value.toString().trim() == '' ? 'N/A' : value.toString()
 }
 
-def slackSection(Map details) {
+def slackSection(details) {
+    if (details instanceof List) {
+        return details.collect { value ->
+            "- ${slackDisplay(value)}"
+        }.join('\n')
+    }
+
     return details.collect { key, value ->
         "- ${key}: ${slackDisplay(value)}"
     }.join('\n')
+}
+
+def setDeployPhase(String phase) {
+    env.DEPLOY_PHASE = phase
+    writeFile(file: '.frontend-deploy-phase', text: phase)
+}
+
+def currentDeployPhase() {
+    String phase = ''
+    if (fileExists('.frontend-deploy-phase')) {
+        phase = readFile('.frontend-deploy-phase').trim()
+    }
+    if (!phase) {
+        phase = env.DEPLOY_PHASE ?: 'UNKNOWN'
+    }
+    return phase == 'PIPELINE_INITIALIZED' ? 'UNKNOWN' : phase
+}
+
+def currentInvalidationId() {
+    String invalidationId = ''
+    if (fileExists('cloudfront-invalidation-id.txt')) {
+        invalidationId = readFile('cloudfront-invalidation-id.txt').trim()
+    }
+    if (!invalidationId) {
+        invalidationId = env.CLOUDFRONT_INVALIDATION_ID ?: ''
+    }
+    return invalidationId in ['', 'N/A', 'None', 'null'] ? 'N/A' : invalidationId
 }
 
 def frontendRunbookLink() {
@@ -17,8 +50,7 @@ def sendSlackNotification(String title, Map details) {
     String payloadFile = ".slack-payload-${env.BUILD_NUMBER ?: 'unknown'}.json"
     try {
         String body = ([title] + details.collect { key, value ->
-            String displayValue = slackDisplay(value)
-            displayValue.contains('\n') ? "*${key}:*\n${displayValue}" : "*${key}:* ${displayValue}"
+            "*${key}:*\n${slackDisplay(value)}"
         }).join('\n\n')
         writeFile(file: messageFile, text: body)
         withCredentials([
@@ -77,6 +109,17 @@ def value(name):
     result = os.environ.get(name)
     return result if result else "N/A"
 
+def invalidation_id():
+    env_result = value("CLOUDFRONT_INVALIDATION_ID")
+    if env_result not in ("", "N/A", "None", "null"):
+        return env_result
+    try:
+        with open("cloudfront-invalidation-id.txt", "r", encoding="utf-8") as id_file:
+            file_result = id_file.read().strip()
+            return file_result if file_result else "N/A"
+    except FileNotFoundError:
+        return "N/A"
+
 summary = {
     "schema_version": "1.0",
     "service_type": "frontend",
@@ -89,7 +132,7 @@ summary = {
     "short_sha": value("GIT_SHORT_SHA"),
     "s3_bucket": value("S3_BUCKET"),
     "cloudfront_distribution_id": value("CLOUDFRONT_DISTRIBUTION_ID"),
-    "invalidation_id": value("CLOUDFRONT_INVALIDATION_ID"),
+    "invalidation_id": invalidation_id(),
     "domain": value("FRONTEND_URL"),
     "verification_result": value("VERIFICATION_RESULT"),
     "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -134,7 +177,7 @@ pipeline {
         stage('Source Checkout') {
             steps {
                 script {
-                    env.DEPLOY_PHASE = 'SOURCE_CHECKOUT'
+                    setDeployPhase('SOURCE_CHECKOUT')
                 }
                 checkout(scm)
                 script {
@@ -161,7 +204,7 @@ pipeline {
         stage('Static File Validation') {
             steps {
                 script {
-                    env.DEPLOY_PHASE = 'STATIC_FILE_VALIDATION'
+                    setDeployPhase('STATIC_FILE_VALIDATION')
                 }
                 sh '''
                     set -eu
@@ -185,7 +228,7 @@ pipeline {
         stage('S3 Upload') {
             steps {
                 script {
-                    env.DEPLOY_PHASE = 'S3_UPLOAD'
+                    setDeployPhase('S3_UPLOAD')
                 }
                 sh '''
                     set -eu
@@ -210,7 +253,7 @@ pipeline {
         stage('CloudFront Invalidation') {
             steps {
                 script {
-                    env.DEPLOY_PHASE = 'CLOUDFRONT_INVALIDATION'
+                    setDeployPhase('CLOUDFRONT_INVALIDATION')
                 }
                 script {
                     sh '''
@@ -241,7 +284,7 @@ pipeline {
                     '''
                     String invalidationId = readFile('cloudfront-invalidation-id.txt').trim()
                     env.CLOUDFRONT_INVALIDATION_ID = invalidationId ?: 'N/A'
-                    echo "CloudFront invalidation ID: ${env.CLOUDFRONT_INVALIDATION_ID}"
+                    echo "CloudFront invalidation ID: ${currentInvalidationId()}"
                 }
             }
         }
@@ -249,7 +292,7 @@ pipeline {
         stage('Post-Deploy Verification') {
             steps {
                 script {
-                    env.DEPLOY_PHASE = 'POST_DEPLOY_VERIFICATION'
+                    setDeployPhase('POST_DEPLOY_VERIFICATION')
                 }
                 sh '''
                     set -eu
@@ -283,8 +326,9 @@ pipeline {
         stage('Deployment Summary') {
             steps {
                 script {
-                    env.DEPLOY_PHASE = 'DEPLOY_SUCCESS'
+                    setDeployPhase('DEPLOY_SUCCESS')
                     env.SUMMARY_BUILD_RESULT = 'SUCCESS'
+                    env.CLOUDFRONT_INVALIDATION_ID = currentInvalidationId()
                     writeFrontendSummary('SUCCESS')
                 }
             }
@@ -297,8 +341,7 @@ pipeline {
                 sendSlackNotification(':white_check_mark: Frontend 배포 성공', [
                     '핵심 상태': slackSection([
                         Build : "#${env.BUILD_NUMBER}",
-                        Result: 'SUCCESS',
-                        Phase : env.DEPLOY_PHASE
+                        Result: 'SUCCESS'
                     ]),
                     '배포 정보': slackSection([
                         Repo        : env.REPOSITORY_NAME,
@@ -306,7 +349,7 @@ pipeline {
                         Commit      : env.GIT_SHORT_SHA,
                         'S3 Bucket' : env.S3_BUCKET,
                         CloudFront  : env.CLOUDFRONT_DISTRIBUTION_ID,
-                        Invalidation: env.CLOUDFRONT_INVALIDATION_ID
+                        Invalidation: currentInvalidationId()
                     ]),
                     '검증': slackSection([
                         Domain         : env.FRONTEND_URL,
@@ -326,12 +369,13 @@ pipeline {
                 if (env.VERIFICATION_RESULT == 'NOT_RUN') {
                     env.VERIFICATION_RESULT = 'FAILED'
                 }
+                env.CLOUDFRONT_INVALIDATION_ID = currentInvalidationId()
                 writeFrontendSummary(env.SUMMARY_BUILD_RESULT)
                 sendSlackNotification(':x: Frontend 배포 실패', [
                     '핵심 상태': slackSection([
                         Build         : "#${env.BUILD_NUMBER}",
                         Result        : 'FAILED',
-                        'Failed Stage': env.DEPLOY_PHASE
+                        'Failed Stage': currentDeployPhase()
                     ]),
                     '배포 정보': slackSection([
                         Repo        : env.REPOSITORY_NAME,
@@ -341,11 +385,11 @@ pipeline {
                         CloudFront  : env.CLOUDFRONT_DISTRIBUTION_ID
                     ]),
                     '다음 확인': slackSection([
-                        '1': 'Jenkins Console Log',
-                        '2': 'S3 업로드 결과',
-                        '3': 'CloudFront Invalidation 상태',
-                        '4': "${env.FRONTEND_URL} 응답",
-                        '5': 'CloudFront 캐시 반영 여부'
+                        'Jenkins Console Log',
+                        'S3 업로드 결과',
+                        'CloudFront Invalidation 상태',
+                        "${env.FRONTEND_URL} 응답",
+                        'CloudFront 캐시 반영 여부'
                     ]),
                     '링크': slackSection([
                         Jenkins: env.BUILD_URL,
@@ -362,7 +406,7 @@ pipeline {
             )
             sh '''
                 set +e
-                rm -f frontend-index.html frontend-app.js frontend-style.css cloudfront-invalidation.json cloudfront-invalidation-id.txt
+                rm -f frontend-index.html frontend-app.js frontend-style.css cloudfront-invalidation.json cloudfront-invalidation-id.txt .frontend-deploy-phase
             '''
         }
     }

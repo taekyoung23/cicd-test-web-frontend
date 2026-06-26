@@ -168,9 +168,6 @@ pipeline {
         CLOUDFRONT_DISTRIBUTION_ID = 'E2ZAHL4TTM1M8O'
         FRONTEND_URL = 'https://mzmt.shop'
         DEPLOYMENT_SUMMARY_DIR = 'deployment-summaries'
-        DEPLOY_PHASE = 'PIPELINE_INITIALIZED'
-        VERIFICATION_RESULT = 'NOT_RUN'
-        CLOUDFRONT_INVALIDATION_ID = 'N/A'
     }
 
     stages {
@@ -370,7 +367,7 @@ pipeline {
         unsuccessful {
             script {
                 env.SUMMARY_BUILD_RESULT = currentBuild.currentResult ?: 'FAILED'
-                if (env.VERIFICATION_RESULT == 'NOT_RUN') {
+                if (!env.VERIFICATION_RESULT || env.VERIFICATION_RESULT == 'NOT_RUN') {
                     env.VERIFICATION_RESULT = 'FAILED'
                 }
                 env.CLOUDFRONT_INVALIDATION_ID = currentInvalidationId()

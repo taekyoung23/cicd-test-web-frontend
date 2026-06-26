@@ -213,9 +213,10 @@ pipeline {
                     env.DEPLOY_PHASE = 'CLOUDFRONT_INVALIDATION'
                 }
                 script {
-                    env.CLOUDFRONT_INVALIDATION_ID = sh(
-                        script: '''
+                    sh '''
                             set -eu
+                            rm -f cloudfront-invalidation.json cloudfront-invalidation-id.txt
+
                             aws cloudfront create-invalidation \
                               --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
                               --paths "/" "/index.html" "/app.js" "/style.css" \
@@ -231,13 +232,14 @@ with open("cloudfront-invalidation.json", "r", encoding="utf-8") as response_fil
 invalidation_id = response.get("Invalidation", {}).get("Id")
 if not invalidation_id or invalidation_id in {"N/A", "None", "null"}:
     print("CloudFront invalidation ID was not returned.", file=sys.stderr)
+    print(json.dumps(response, indent=2), file=sys.stderr)
     sys.exit(1)
 
-print(invalidation_id)
+with open("cloudfront-invalidation-id.txt", "w", encoding="utf-8") as id_file:
+    id_file.write(invalidation_id)
 PY
-                        ''',
-                        returnStdout: true
-                    ).trim()
+                    '''
+                    env.CLOUDFRONT_INVALIDATION_ID = readFile('cloudfront-invalidation-id.txt').trim()
                     if (!env.CLOUDFRONT_INVALIDATION_ID ||
                         ['N/A', 'None', 'null'].contains(env.CLOUDFRONT_INVALIDATION_ID)) {
                         error('CloudFront invalidation ID was not returned.')
@@ -370,7 +372,7 @@ PY
             )
             sh '''
                 set +e
-                rm -f frontend-index.html frontend-app.js frontend-style.css cloudfront-invalidation.json
+                rm -f frontend-index.html frontend-app.js frontend-style.css cloudfront-invalidation.json cloudfront-invalidation-id.txt
             '''
         }
     }

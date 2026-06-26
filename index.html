@@ -1,0 +1,223 @@
+﻿<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SecureVoiceGuard</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#upload" aria-label="SecureVoiceGuard home">
+        <span class="brand-mark">SV</span>
+        <span>SecureVoiceGuard</span>
+      </a>
+      <nav class="top-nav" aria-label="Main navigation">
+        <a href="#upload">Upload</a>
+        <a href="#about">About</a>
+        <button id="loginOpenButton" class="login-nav-button" type="button">
+          <span class="login-icon" aria-hidden="true">◎</span>
+          Sign in
+        </button>
+        <button id="logoutButton" class="logout-button hidden" type="button">
+          Logout
+        </button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="upload" class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">AI Voice Integrity Demo</p>
+          <h1>Analyze suspicious voice files</h1>
+          <p class="hero-description">
+            음성 파일을 업로드하면 AI가 위변조 가능성을 분석해 REAL 또는 FAKE 결과를 제공합니다.
+          </p>
+        </div>
+
+        <div class="workspace">
+          <section class="upload-card" aria-labelledby="upload-title">
+            <div id="currentUser" class="current-user hidden"></div>
+            <div class="tab-row" role="tablist" aria-label="Analysis workspace">
+              <button id="fileTabButton" class="tab active" type="button" role="tab" aria-controls="uploadPanel" aria-selected="true">FILE</button>
+              <button id="historyTabButton" class="tab" type="button" role="tab" aria-controls="historyPanel" aria-selected="false">조회하기</button>
+            </div>
+
+            <div id="uploadPanel" class="workspace-panel" role="tabpanel" aria-labelledby="fileTabButton">
+              <!-- 수정된 drop-zone 영역 시작 -->
+              <div class="drop-zone" id="dropZone" role="button" tabindex="0">
+              <input
+                id="fileInput"
+                class="file-input-hidden"
+                type="file"
+                accept="audio/*,.wav,.mp3,.m4a,.flac"
+              />
+
+              <div class="upload-icon" aria-hidden="true">↑</div>
+              <h2 id="upload-title">Choose file</h2>
+              <p>Click here or drag and drop a voice file</p>
+              </div>
+              <!-- 수정된 drop-zone 영역 끝 -->
+
+              <p id="selectedFileName" class="file-name">선택된 파일이 없습니다.</p>
+              <button id="analyzeButton" class="analyze-button" type="button">
+                Analyze
+              </button>
+              <p class="privacy-note">
+                민감한 음성 데이터 보호를 위해 실제 서비스에서는 업로드 파일의 암호화 저장과 보관 기간 이후 삭제를 적용합니다.
+              </p>
+            </div>
+
+            <div id="historyPanel" class="workspace-panel history-panel hidden" role="tabpanel" aria-labelledby="historyTabButton">
+              <div class="history-heading">
+                <div>
+                  <p class="section-label">My Analysis</p>
+                  <h2>내가 올린 분석 조회</h2>
+                </div>
+                <button id="historyRefreshButton" class="ghost-button" type="button">새로고침</button>
+              </div>
+
+              <div id="historyLoginNotice" class="history-state hidden">
+                <strong>로그인이 필요합니다.</strong>
+                <p>내가 업로드한 분석 이력은 로그인 후 조회할 수 있습니다.</p>
+                <button id="historyLoginButton" class="primary-button" type="button">로그인하기</button>
+              </div>
+
+              <div id="historyLoading" class="history-state hidden">분석 이력을 불러오는 중입니다.</div>
+              <div id="historyEmpty" class="history-state hidden">아직 조회할 분석 이력이 없습니다.</div>
+
+              <div id="historyTable" class="table-wrap hidden">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>요청 ID</th>
+                      <th>상태</th>
+                      <th>결과</th>
+                      <th>신뢰도</th>
+                      <th>생성 시간</th>
+                      <th>보기</th>
+                    </tr>
+                  </thead>
+                  <tbody id="historyTableBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <div id="loginModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+        <div class="modal-backdrop" id="loginBackdrop"></div>
+        <section class="login-panel modal-panel" aria-labelledby="authTitle">
+          <div class="modal-header">
+            <div class="panel-heading">
+              <p class="section-label">Account</p>
+              <h2 id="authTitle">SecureVoiceGuard 로그인</h2>
+            </div>
+            <button id="loginCloseButton" class="icon-button" type="button" aria-label="로그인 창 닫기">×</button>
+          </div>
+
+          <div class="auth-tabs" role="tablist" aria-label="계정 작업">
+            <button id="showLoginButton" class="auth-tab active" type="button">로그인</button>
+            <button id="showSignupButton" class="auth-tab" type="button">회원가입</button>
+          </div>
+
+          <p id="authHelp" class="form-helper">
+            비로그인 상태에서도 바로 분석을 체험할 수 있습니다. 더 많은 분석과 고객사 대시보드는 계정 로그인 후 사용할 수 있습니다.
+          </p>
+
+          <form id="loginForm" class="login-form">
+            <label>
+              이메일
+              <input
+                id="emailInput"
+                type="email"
+                placeholder="free@test.com"
+                autocomplete="username"
+              />
+            </label>
+            <label>
+              비밀번호
+              <input
+                id="passwordInput"
+                type="password"
+                placeholder="1234"
+                autocomplete="current-password"
+              />
+            </label>
+            <div class="action-row">
+              <button type="submit" class="primary-button">로그인</button>
+            </div>
+          </form>
+
+          <form id="signupForm" class="login-form hidden">
+            <label>
+              이메일
+              <input
+                id="signupEmailInput"
+                type="email"
+                placeholder="new-user@example.com"
+                autocomplete="email"
+              />
+            </label>
+            <label>
+              비밀번호
+              <input
+                id="signupPasswordInput"
+                type="password"
+                placeholder="4자 이상"
+                autocomplete="new-password"
+              />
+            </label>
+            <label>
+              표시 이름
+              <input
+                id="signupNameInput"
+                type="text"
+                placeholder="예: 무료 사용자"
+                autocomplete="name"
+              />
+            </label>
+            <div class="action-row">
+              <button type="submit" class="primary-button">무료 계정 만들기</button>
+            </div>
+          </form>
+
+          <details class="demo-hint">
+            <summary>발표용 테스트 계정 보기</summary>
+            <ul>
+              <li>무료 사용자: free@test.com / 1234</li>
+              <li>유료 고객: paid@bank-a.com / 1234</li>
+            </ul>
+          </details>
+          <p id="loginMessage" class="message"></p>
+        </section>
+      </div>
+
+      <section class="result-band" aria-live="polite">
+        <div id="requestSummary" class="summary-card hidden"></div>
+        <div id="resultCard" class="result-card hidden"></div>
+      </section>
+
+      <section id="paidUsageSection" class="dashboard-section hidden">
+        <div class="panel-heading">
+          <p class="section-label">Paid Customer Usage</p>
+          <h2>고객사 사용량</h2>
+        </div>
+        <div id="usageCards" class="metric-grid"></div>
+      </section>
+
+      <section id="about" class="info-section">
+        <div>
+          <p class="section-label">About</p>
+          <h2>AWS 배포 전 로컬 검증 데모</h2>
+          <p>
+            SecureVoiceGuard는 S3 업로드, SQS 대기열, ECS Worker, RDS 결과 저장, CloudWatch 모니터링으로 확장될 수 있는 흐름을 로컬 mock API로 검증합니다.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

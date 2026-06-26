@@ -219,12 +219,27 @@ pipeline {
                             aws cloudfront create-invalidation \
                               --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
                               --paths "/" "/index.html" "/app.js" "/style.css" \
-                              --query 'Invalidation.Id' \
-                              --output text
+                              --output json > cloudfront-invalidation.json
+
+                            python3 - <<'PY'
+import json
+import sys
+
+with open("cloudfront-invalidation.json", "r", encoding="utf-8") as response_file:
+    response = json.load(response_file)
+
+invalidation_id = response.get("Invalidation", {}).get("Id")
+if not invalidation_id or invalidation_id in {"N/A", "None", "null"}:
+    print("CloudFront invalidation ID was not returned.", file=sys.stderr)
+    sys.exit(1)
+
+print(invalidation_id)
+PY
                         ''',
                         returnStdout: true
                     ).trim()
-                    if (!env.CLOUDFRONT_INVALIDATION_ID || env.CLOUDFRONT_INVALIDATION_ID == 'None') {
+                    if (!env.CLOUDFRONT_INVALIDATION_ID ||
+                        ['N/A', 'None', 'null'].contains(env.CLOUDFRONT_INVALIDATION_ID)) {
                         error('CloudFront invalidation ID was not returned.')
                     }
                     echo "CloudFront invalidation ID: ${env.CLOUDFRONT_INVALIDATION_ID}"
@@ -355,7 +370,7 @@ pipeline {
             )
             sh '''
                 set +e
-                rm -f frontend-index.html frontend-app.js frontend-style.css
+                rm -f frontend-index.html frontend-app.js frontend-style.css cloudfront-invalidation.json
             '''
         }
     }

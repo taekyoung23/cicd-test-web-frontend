@@ -232,21 +232,17 @@ pipeline {
                             fi
 
                             echo "Parsed CloudFront invalidation ID: ${INVALIDATION_ID}"
+
+                            timeout 10m aws cloudfront wait invalidation-completed \
+                              --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+                              --id "${INVALIDATION_ID}"
+
+                            echo "CloudFront invalidation completed: ${INVALIDATION_ID}"
                     '''
-                    env.CLOUDFRONT_INVALIDATION_ID = readFile('cloudfront-invalidation-id.txt').trim()
-                    if (!env.CLOUDFRONT_INVALIDATION_ID ||
-                        ['N/A', 'None', 'null'].contains(env.CLOUDFRONT_INVALIDATION_ID)) {
-                        error('CloudFront invalidation ID was not returned.')
-                    }
+                    String invalidationId = readFile('cloudfront-invalidation-id.txt').trim()
+                    env.CLOUDFRONT_INVALIDATION_ID = invalidationId ?: 'N/A'
                     echo "CloudFront invalidation ID: ${env.CLOUDFRONT_INVALIDATION_ID}"
                 }
-                sh '''
-                    set -eu
-                    timeout 10m aws cloudfront wait invalidation-completed \
-                      --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
-                      --id "${CLOUDFRONT_INVALIDATION_ID}"
-                    echo "CloudFront invalidation completed: ${CLOUDFRONT_INVALIDATION_ID}"
-                '''
             }
         }
 

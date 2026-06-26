@@ -220,24 +220,18 @@ pipeline {
                             aws cloudfront create-invalidation \
                               --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
                               --paths "/" "/index.html" "/app.js" "/style.css" \
-                              --output json > cloudfront-invalidation.json
+                              --query 'Invalidation.Id' \
+                              --output text > cloudfront-invalidation-id.txt
 
-                            python3 - <<'PY'
-import json
-import sys
+                            INVALIDATION_ID="$(tr -d '\\r\\n\\t ' < cloudfront-invalidation-id.txt)"
+                            printf '%s' "${INVALIDATION_ID}" > cloudfront-invalidation-id.txt
 
-with open("cloudfront-invalidation.json", "r", encoding="utf-8") as response_file:
-    response = json.load(response_file)
+                            if [ -z "${INVALIDATION_ID}" ] || [ "${INVALIDATION_ID}" = "N/A" ] || [ "${INVALIDATION_ID}" = "None" ] || [ "${INVALIDATION_ID}" = "null" ]; then
+                              echo "CloudFront invalidation ID was not returned." >&2
+                              exit 1
+                            fi
 
-invalidation_id = response.get("Invalidation", {}).get("Id")
-if not invalidation_id or invalidation_id in {"N/A", "None", "null"}:
-    print("CloudFront invalidation ID was not returned.", file=sys.stderr)
-    print(json.dumps(response, indent=2), file=sys.stderr)
-    sys.exit(1)
-
-with open("cloudfront-invalidation-id.txt", "w", encoding="utf-8") as id_file:
-    id_file.write(invalidation_id)
-PY
+                            echo "Parsed CloudFront invalidation ID: ${INVALIDATION_ID}"
                     '''
                     env.CLOUDFRONT_INVALIDATION_ID = readFile('cloudfront-invalidation-id.txt').trim()
                     if (!env.CLOUDFRONT_INVALIDATION_ID ||

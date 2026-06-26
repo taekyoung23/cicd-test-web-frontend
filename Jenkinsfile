@@ -32,11 +32,11 @@ def currentDeployPhase() {
 
 def currentInvalidationId() {
     String invalidationId = ''
-    if (fileExists('cloudfront-invalidation-id.txt')) {
-        invalidationId = readFile('cloudfront-invalidation-id.txt').trim()
-    }
-    if (!invalidationId) {
-        invalidationId = env.CLOUDFRONT_INVALIDATION_ID ?: ''
+    invalidationId = env.CLOUDFRONT_INVALIDATION_ID ?: ''
+    if (!invalidationId || ['N/A', 'None', 'null'].contains(invalidationId)) {
+        if (fileExists('cloudfront-invalidation-id.txt')) {
+            invalidationId = readFile('cloudfront-invalidation-id.txt').trim()
+        }
     }
     return invalidationId in ['', 'N/A', 'None', 'null'] ? 'N/A' : invalidationId
 }
@@ -256,7 +256,9 @@ pipeline {
                     setDeployPhase('CLOUDFRONT_INVALIDATION')
                 }
                 script {
-                    sh '''
+                    String invalidationId = sh(
+                        returnStdout: true,
+                        script: '''
                             set -eu
                             rm -f cloudfront-invalidation.json cloudfront-invalidation-id.txt
 
@@ -274,16 +276,18 @@ pipeline {
                               exit 1
                             fi
 
-                            echo "Parsed CloudFront invalidation ID: ${INVALIDATION_ID}"
+                            echo "Parsed CloudFront invalidation ID: ${INVALIDATION_ID}" >&2
 
                             timeout 10m aws cloudfront wait invalidation-completed \
                               --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
                               --id "${INVALIDATION_ID}"
 
-                            echo "CloudFront invalidation completed: ${INVALIDATION_ID}"
-                    '''
-                    String invalidationId = readFile('cloudfront-invalidation-id.txt').trim()
+                            echo "CloudFront invalidation completed: ${INVALIDATION_ID}" >&2
+                            printf '%s' "${INVALIDATION_ID}"
+                        '''
+                    ).trim()
                     env.CLOUDFRONT_INVALIDATION_ID = invalidationId ?: 'N/A'
+                    writeFile(file: 'cloudfront-invalidation-id.txt', text: env.CLOUDFRONT_INVALIDATION_ID)
                     echo "CloudFront invalidation ID: ${currentInvalidationId()}"
                 }
             }

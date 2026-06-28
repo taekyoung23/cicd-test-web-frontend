@@ -41,6 +41,239 @@ def currentInvalidationId() {
     return invalidationId in ['', 'N/A', 'None', 'null'] ? 'N/A' : invalidationId
 }
 
+def isMissingValue(value) {
+    String normalized = value == null ? '' : value.toString().trim()
+    return normalized in ['', 'N/A', 'None', 'null']
+}
+
+def initializeFrontendRollbackState() {
+    env.FRONTEND_DEPLOY_STARTED = 'false'
+    env.FRONTEND_BASELINE_CAPTURED = 'false'
+    env.FRONTEND_ROLLBACK_REQUIRED = 'false'
+    env.FRONTEND_ROLLBACK_EXECUTED = 'false'
+    env.FRONTEND_ROLLBACK_RESULT = 'NOT_REQUIRED'
+    env.FRONTEND_ROLLBACK_TRIGGER = 'N/A'
+    env.FRONTEND_ROLLBACK_INVALIDATION_ID = 'N/A'
+    env.POST_ROLLBACK_VERIFICATION_RESULT = 'NOT_RUN'
+    env.BASELINE_INDEX_VERSION_ID = 'N/A'
+    env.BASELINE_APP_VERSION_ID = 'N/A'
+    env.BASELINE_STYLE_VERSION_ID = 'N/A'
+}
+
+def captureS3BaselineVersions() {
+    Map files = [
+        'index.html': 'BASELINE_INDEX_VERSION_ID',
+        'app.js'    : 'BASELINE_APP_VERSION_ID',
+        'style.css' : 'BASELINE_STYLE_VERSION_ID'
+    ]
+
+    files.each { key, envName ->
+        String versionId = sh(
+            returnStdout: true,
+            script: """
+                set -eu
+                aws s3api list-object-versions \\
+                  --bucket '${env.S3_BUCKET}' \\
+                  --prefix '${key}' \\
+                  --query "Versions[?IsLatest && Key=='${key}'].VersionId | [0]" \\
+                  --output text
+            """
+        ).trim()
+
+        if (isMissingValue(versionId)) {
+            error("Could not capture baseline S3 VersionId for ${key}.")
+        }
+
+        if (envName == 'BASELINE_INDEX_VERSION_ID') {
+            env.BASELINE_INDEX_VERSION_ID = versionId
+        } else if (envName == 'BASELINE_APP_VERSION_ID') {
+            env.BASELINE_APP_VERSION_ID = versionId
+        } else if (envName == 'BASELINE_STYLE_VERSION_ID') {
+            env.BASELINE_STYLE_VERSION_ID = versionId
+        } else {
+            error("Unsupported baseline env name: ${envName}")
+        }
+        echo "Captured S3 baseline VersionId for ${key}: ${versionId}"
+    }
+
+    env.FRONTEND_BASELINE_CAPTURED = 'true'
+    writeFile(
+        file: 'frontend-s3-baseline-versions.json',
+        text: """{
+  "index.html": "${env.BASELINE_INDEX_VERSION_ID}",
+  "app.js": "${env.BASELINE_APP_VERSION_ID}",
+  "style.css": "${env.BASELINE_STYLE_VERSION_ID}"
+}
+"""
+    )
+}
+
+def restoreS3BaselineVersions() {
+    Map files = [
+        'index.html': env.BASELINE_INDEX_VERSION_ID,
+        'app.js'    : env.BASELINE_APP_VERSION_ID,
+        'style.css' : env.BASELINE_STYLE_VERSION_ID
+    ]
+
+    files.each { key, versionId ->
+        if (isMissingValue(versionId)) {
+            error("Missing baseline S3 VersionId for ${key}.")
+        }
+
+        sh """
+            set -eu
+            ENCODED_VERSION_ID="\$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' '${versionId}')"
+            COPY_SOURCE="${env.S3_BUCKET}/${key}?versionId=\${ENCODED_VERSION_ID}"
+            aws s3api copy-object \\
+              --bucket '${env.S3_BUCKET}' \\
+              --copy-source "\${COPY_SOURCE}" \\
+              --key '${key}' \\
+              --metadata-directive COPY >/dev/null
+            echo "Restored ${key} from baseline VersionId ${versionId}"
+        """
+    }
+}
+
+def createFrontendRollbackInvalidation() {
+    String invalidationId = sh(
+        returnStdout: true,
+        script: '''
+            set -eu
+            rm -f cloudfront-rollback-invalidation-id.txt
+
+            aws cloudfront create-invalidation \
+              --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+              --paths "/" "/index.html" "/app.js" "/style.css" \
+              --query 'Invalidation.Id' \
+              --output text > cloudfront-rollback-invalidation-id.txt
+
+            INVALIDATION_ID="$(tr -d '\\r\\n\\t ' < cloudfront-rollback-invalidation-id.txt)"
+            printf '%s' "${INVALIDATION_ID}" > cloudfront-rollback-invalidation-id.txt
+
+            if [ -z "${INVALIDATION_ID}" ] || [ "${INVALIDATION_ID}" = "N/A" ] || [ "${INVALIDATION_ID}" = "None" ] || [ "${INVALIDATION_ID}" = "null" ]; then
+              echo "Rollback CloudFront invalidation ID was not returned." >&2
+              exit 1
+            fi
+
+            echo "Parsed rollback CloudFront invalidation ID: ${INVALIDATION_ID}" >&2
+
+            timeout 10m aws cloudfront wait invalidation-completed \
+              --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+              --id "${INVALIDATION_ID}"
+
+            echo "Rollback CloudFront invalidation completed: ${INVALIDATION_ID}" >&2
+            printf '%s' "${INVALIDATION_ID}"
+        '''
+    ).trim()
+
+    if (isMissingValue(invalidationId)) {
+        error('Rollback CloudFront invalidation ID was not returned.')
+    }
+
+    env.FRONTEND_ROLLBACK_INVALIDATION_ID = invalidationId
+    writeFile(file: 'cloudfront-rollback-invalidation-id.txt', text: invalidationId)
+    return invalidationId
+}
+
+def verifyFrontendRollback() {
+    int status = sh(
+        returnStatus: true,
+        script: '''
+            set +e
+
+            for attempt in 1 2 3 4 5; do
+              echo "Frontend post-rollback verification attempt ${attempt}/5"
+              rm -f frontend-rollback-index.html frontend-rollback-app.js frontend-rollback-style.css
+
+              if curl --fail --silent --show-error --location "${FRONTEND_URL}/" -o frontend-rollback-index.html && \
+                 grep -q 'SecureVoiceGuard' frontend-rollback-index.html && \
+                 curl --fail --silent --show-error --location "${FRONTEND_URL}/app.js" -o frontend-rollback-app.js && \
+                 curl --fail --silent --show-error --location "${FRONTEND_URL}/style.css" -o frontend-rollback-style.css; then
+                echo "Frontend post-rollback verification passed."
+                exit 0
+              fi
+
+              if [ "${attempt}" -lt 5 ]; then
+                sleep 10
+              fi
+            done
+
+            echo "Frontend post-rollback verification failed."
+            exit 1
+        '''
+    )
+
+    if (status == 0) {
+        env.POST_ROLLBACK_VERIFICATION_RESULT = 'PASSED'
+        env.FRONTEND_ROLLBACK_RESULT = 'RECOVERY_VERIFIED'
+    } else {
+        env.POST_ROLLBACK_VERIFICATION_RESULT = 'FAILED'
+        env.FRONTEND_ROLLBACK_RESULT = 'ROLLBACK_VERIFICATION_FAILED'
+    }
+
+    return status == 0
+}
+
+def performFrontendRollbackIfNeeded() {
+    if (env.FRONTEND_ROLLBACK_EXECUTED == 'true') {
+        return
+    }
+
+    if (env.FRONTEND_DEPLOY_STARTED != 'true' || env.FRONTEND_BASELINE_CAPTURED != 'true') {
+        env.FRONTEND_ROLLBACK_REQUIRED = 'false'
+        env.FRONTEND_ROLLBACK_RESULT = 'NOT_REQUIRED'
+        echo 'Frontend rollback is not required because deployment did not modify S3 objects or baseline was not captured.'
+        return
+    }
+
+    env.FRONTEND_ROLLBACK_REQUIRED = 'true'
+    env.FRONTEND_ROLLBACK_TRIGGER = currentDeployPhase()
+    env.FRONTEND_ROLLBACK_EXECUTED = 'true'
+    env.FRONTEND_ROLLBACK_RESULT = 'IN_PROGRESS'
+
+    try {
+        restoreS3BaselineVersions()
+        createFrontendRollbackInvalidation()
+        verifyFrontendRollback()
+    } catch (Exception rollbackError) {
+        env.FRONTEND_ROLLBACK_RESULT = 'ROLLBACK_FAILED'
+        env.POST_ROLLBACK_VERIFICATION_RESULT = env.POST_ROLLBACK_VERIFICATION_RESULT ?: 'NOT_RUN'
+        echo "Frontend rollback failed: ${rollbackError.getMessage()}"
+    }
+}
+
+def sendFrontendRollbackSlack() {
+    if (env.FRONTEND_ROLLBACK_EXECUTED != 'true') {
+        return
+    }
+
+    sendSlackNotification(':warning: Frontend Rollback 결과 - S3 baseline 복구', [
+        '복구 결과': slackSection([
+            Result             : env.FRONTEND_ROLLBACK_RESULT,
+            Trigger            : env.FRONTEND_ROLLBACK_TRIGGER ?: currentDeployPhase(),
+            'Baseline Restored': env.FRONTEND_ROLLBACK_RESULT == 'RECOVERY_VERIFIED' ? 'Yes' : 'Check required'
+        ]),
+        '복원 파일': slackSection([
+            'index.html': env.FRONTEND_ROLLBACK_RESULT == 'RECOVERY_VERIFIED' ? 'restored' : 'check required',
+            'app.js'    : env.FRONTEND_ROLLBACK_RESULT == 'RECOVERY_VERIFIED' ? 'restored' : 'check required',
+            'style.css' : env.FRONTEND_ROLLBACK_RESULT == 'RECOVERY_VERIFIED' ? 'restored' : 'check required'
+        ]),
+        'CloudFront': slackSection([
+            'Rollback Invalidation': env.FRONTEND_ROLLBACK_INVALIDATION_ID
+        ]),
+        '검증': slackSection([
+            Domain         : env.FRONTEND_URL,
+            'HTTP Status'  : env.POST_ROLLBACK_VERIFICATION_RESULT == 'PASSED' ? '200' : 'Check required',
+            'Content Check': env.POST_ROLLBACK_VERIFICATION_RESULT == 'PASSED' ? 'SecureVoiceGuard OK' : 'Check required',
+            Assets         : env.POST_ROLLBACK_VERIFICATION_RESULT == 'PASSED' ? 'app.js/style.css OK' : 'Check required'
+        ]),
+        '링크': slackSection([
+            Jenkins: env.BUILD_URL,
+            Runbook: frontendRunbookLink()
+        ])
+    ])
+}
+
 def frontendRunbookLink() {
     return '<https://github.com/taekyoung23/cicd-test-web-frontend/blob/ktk-cicd/docs/runbooks/frontend-deployment-runbook.md|운영 가이드>'
 }
@@ -135,6 +368,17 @@ summary = {
     "invalidation_id": invalidation_id(),
     "domain": value("FRONTEND_URL"),
     "verification_result": value("VERIFICATION_RESULT"),
+    "rollback_required": value("FRONTEND_ROLLBACK_REQUIRED"),
+    "rollback_executed": value("FRONTEND_ROLLBACK_EXECUTED"),
+    "rollback_result": value("FRONTEND_ROLLBACK_RESULT"),
+    "rollback_trigger": value("FRONTEND_ROLLBACK_TRIGGER"),
+    "baseline_versions": {
+        "index.html": value("BASELINE_INDEX_VERSION_ID"),
+        "app.js": value("BASELINE_APP_VERSION_ID"),
+        "style.css": value("BASELINE_STYLE_VERSION_ID"),
+    },
+    "rollback_invalidation_id": value("FRONTEND_ROLLBACK_INVALIDATION_ID"),
+    "post_rollback_verification": value("POST_ROLLBACK_VERIFICATION_RESULT"),
     "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }
 
@@ -160,6 +404,14 @@ pipeline {
         timeout(time: 20, unit: 'MINUTES')
     }
 
+    parameters {
+        booleanParam(
+            name: 'FORCE_FRONTEND_VERIFY_FAIL',
+            defaultValue: false,
+            description: 'Force post-deploy verification failure after S3 upload and CloudFront invalidation to test S3 versioning rollback.'
+        )
+    }
+
     environment {
         AWS_REGION = 'ap-northeast-2'
         REPOSITORY_NAME = 'cicd-test-web-frontend'
@@ -174,6 +426,7 @@ pipeline {
         stage('Source Checkout') {
             steps {
                 script {
+                    initializeFrontendRollbackState()
                     setDeployPhase('SOURCE_CHECKOUT')
                 }
                 checkout(scm)
@@ -226,6 +479,8 @@ pipeline {
             steps {
                 script {
                     setDeployPhase('S3_UPLOAD')
+                    captureS3BaselineVersions()
+                    env.FRONTEND_DEPLOY_STARTED = 'true'
                 }
                 sh '''
                     set -eu
@@ -294,6 +549,9 @@ pipeline {
             steps {
                 script {
                     setDeployPhase('POST_DEPLOY_VERIFICATION')
+                    if (params.FORCE_FRONTEND_VERIFY_FAIL) {
+                        error('Forced frontend post-deploy verification failure for S3 versioning rollback test.')
+                    }
                 }
                 sh '''
                     set -eu
@@ -371,12 +629,16 @@ pipeline {
                     env.VERIFICATION_RESULT = 'FAILED'
                 }
                 env.CLOUDFRONT_INVALIDATION_ID = currentInvalidationId()
+                performFrontendRollbackIfNeeded()
                 writeFrontendSummary(env.SUMMARY_BUILD_RESULT)
                 sendSlackNotification(':x: Frontend 배포 실패', [
                     '핵심 상태': slackSection([
-                        Build         : "#${env.BUILD_NUMBER}",
-                        Result        : 'FAILED',
-                        'Failed Stage': currentDeployPhase()
+                        Build              : "#${env.BUILD_NUMBER}",
+                        Result             : 'FAILED',
+                        'Failed Stage'     : currentDeployPhase(),
+                        'Rollback Required': env.FRONTEND_ROLLBACK_REQUIRED ?: 'false',
+                        'Rollback Executed': env.FRONTEND_ROLLBACK_EXECUTED ?: 'false',
+                        'Rollback Result'  : env.FRONTEND_ROLLBACK_RESULT ?: 'N/A'
                     ]),
                     '배포 정보': slackSection([
                         Repo        : env.REPOSITORY_NAME,
@@ -389,6 +651,8 @@ pipeline {
                         'Jenkins Console Log',
                         'S3 업로드 결과',
                         'CloudFront Invalidation 상태',
+                        'Rollback Result Slack',
+                        'S3 Object Version',
                         "${env.FRONTEND_URL} 응답",
                         'CloudFront 캐시 반영 여부'
                     ]),
@@ -397,6 +661,7 @@ pipeline {
                         Runbook: frontendRunbookLink()
                     ])
                 ])
+                sendFrontendRollbackSlack()
             }
         }
         always {
@@ -407,7 +672,10 @@ pipeline {
             )
             sh '''
                 set +e
-                rm -f frontend-index.html frontend-app.js frontend-style.css cloudfront-invalidation.json cloudfront-invalidation-id.txt .frontend-deploy-phase
+                rm -f frontend-index.html frontend-app.js frontend-style.css
+                rm -f frontend-rollback-index.html frontend-rollback-app.js frontend-rollback-style.css
+                rm -f cloudfront-invalidation.json cloudfront-invalidation-id.txt cloudfront-rollback-invalidation-id.txt
+                rm -f frontend-s3-baseline-versions.json .frontend-deploy-phase
             '''
         }
     }

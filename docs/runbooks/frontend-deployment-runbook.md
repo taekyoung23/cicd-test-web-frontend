@@ -22,6 +22,7 @@
 - S3 업로드 실패
 - CloudFront Invalidation 실패
 - 배포 후 도메인 및 asset 응답 검증 실패
+- S3 Versioning 기반 자동 rollback 실패
 - Slack 알림 실패
 - Deployment Summary artifact 누락
 
@@ -46,6 +47,7 @@ GitHub ktk-cicd push
 → S3 Upload
 → CloudFront Invalidation
 → Post-Deploy Verification
+→ 실패 시 S3 VersionId 기반 자동 Rollback
 → Slack Notification
 ```
 
@@ -76,6 +78,7 @@ GitHub
 - HTML 응답에 `SecureVoiceGuard` 문자열 포함
 - `https://mzmt.shop/app.js` 응답 성공
 - `https://mzmt.shop/style.css` 응답 성공
+- 실패하지 않았으므로 `rollback_required=false`, `rollback_result=NOT_REQUIRED`
 - Slack 성공 알림 수신
 - Deployment Summary artifact 생성
 
@@ -247,11 +250,15 @@ grep -q '/api/guest' app.js
   - `style.css`
 - 필요한 권한:
   - `s3:ListBucket`
+  - `s3:ListBucketVersions`
   - `s3:GetObject`
+  - `s3:GetObjectVersion`
   - `s3:PutObject`
   - `s3:DeleteObject`
 
 AWS Console에서 `mzc-securevoiceguard-web-dev` bucket의 object 갱신 시간을 확인한다.
+
+S3 Versioning 기반 rollback을 위해 업로드 직전에 기존 `index.html`, `app.js`, `style.css`의 최신 VersionId를 조회한다. 이 단계에서 `s3:ListBucketVersions` 권한이 없으면 배포를 시작하지 못하고 실패한다.
 
 #### 조치 방법
 
@@ -263,6 +270,8 @@ AWS Console에서 `mzc-securevoiceguard-web-dev` bucket의 object 갱신 시간�
 
 - Jenkins Role이 S3 대상 bucket/object에 필요한 최소 권한을 보유
 - S3 Console에서 object 업로드가 가능한 상태
+- S3 Versioning이 Enabled 상태
+- Jenkins Role이 `ListBucketVersions`, `GetObjectVersion` 권한을 보유
 
 ### 4.6 CloudFront Invalidation 실패
 
@@ -333,13 +342,16 @@ AWS Console에서 CloudFront Invalidation이 Completed인지 확인한다.
 - CloudFront Invalidation 완료 여부 확인
 - S3 object의 Last modified 확인
 - HTML에 `SecureVoiceGuard` 문자열이 실제로 포함되어 있는지 확인
-- 캐시 반영 지연 가능성이 있으면 잠시 후 Jenkins 재실행
+- Jenkins 실패 알림과 Rollback 결과 알림을 확인
+- rollback result가 `RECOVERY_VERIFIED`이면 이전 baseline 파일로 복구된 상태로 판단
+- rollback result가 `ROLLBACK_FAILED` 또는 `ROLLBACK_VERIFICATION_FAILED`이면 8장 절차에 따라 수동 확인
 
 #### 재시도 기준
 
 - CloudFront Invalidation Completed
 - S3 object가 최신 버전
 - 도메인과 asset URL이 HTTP 200으로 응답
+- rollback이 실행된 경우 rollback invalidation completed 및 post-rollback verification 통과
 
 ### 4.8 Slack Notification 실패
 
@@ -440,11 +452,21 @@ Jenkins Job 설정에서 SCM 값이 기존 API/Worker Job과 같은 방식인지
   - `style.css`
 - 권한:
   - `s3:ListBucket`
+  - `s3:ListBucketVersions`
   - `s3:GetObject`
+  - `s3:GetObjectVersion`
   - `s3:PutObject`
   - `s3:DeleteObject`
 
 현재 Pipeline은 `aws s3 sync --delete`를 사용하지 않고, 파일 3개만 `aws s3 cp`로 명시적으로 업로드한다.
+
+업로드 직전에 Pipeline은 현재 S3 최신 객체의 VersionId를 baseline으로 저장한다.
+
+- `BASELINE_INDEX_VERSION_ID`
+- `BASELINE_APP_VERSION_ID`
+- `BASELINE_STYLE_VERSION_ID`
+
+이 baseline은 배포 후 검증 실패 시 자동 rollback에 사용된다. baseline capture가 실패하면 S3 object를 변경하기 전에 Pipeline이 중단되어야 한다.
 
 ### CloudFront Invalidation
 
@@ -478,7 +500,17 @@ Slack의 Invalidation ID와 AWS Console의 Invalidation ID가 일치하면 Cloud
 - 5xx/4xx 여부
 - 응답 HTML에 `SecureVoiceGuard` 포함 여부
 
-검증 실패 시 CloudFront Invalidation 완료 여부와 S3 object 최신 여부를 먼저 확인한다.
+검증 실패 시 Pipeline은 S3 Versioning 기반 자동 rollback을 시도한다. 운영자는 실패 알림만 보지 말고 별도로 전송되는 Rollback 결과 Slack과 Deployment Summary의 rollback 필드를 함께 확인한다.
+
+자동 rollback 확인 항목:
+
+- `rollback_required=true`
+- `rollback_executed=true`
+- `rollback_result=RECOVERY_VERIFIED`
+- `rollback_invalidation_id` 존재
+- `post_rollback_verification=PASSED`
+
+`FORCE_FRONTEND_VERIFY_FAIL=true` 파라미터는 배포 후 검증 단계에서 의도적으로 실패를 발생시켜 S3 Versioning rollback을 테스트하기 위한 용도이다. 이 파라미터는 테스트용이며 일반 배포에서는 사용하지 않는다.
 
 ### Slack Notification
 
@@ -521,16 +553,19 @@ API/Worker webhook에 영향이 없도록 Jenkins 전역 shared secret을 변경
 
 ## 7. 수동 복구 절차
 
-Pipeline 실패 시 아래 순서로 대응한다.
+Pipeline 실패 시 아래 순서로 대응한다. 단, S3 Upload 이후 Post-Deploy Verification 실패라면 Jenkins가 먼저 자동 rollback을 시도한다.
 
 1. Jenkins `frontend-cicd` build result와 실패 stage 확인
 2. Jenkins Console Log에서 실패 stage 주변 로그 확인
-3. S3 Console에서 `index.html`, `app.js`, `style.css` object 상태 확인
-4. CloudFront Console에서 Invalidation ID와 status 확인
-5. `https://mzmt.shop/`, `/app.js`, `/style.css` 응답 확인
-6. 원인이 해결되면 Jenkins에서 `Build Now`로 재실행
-7. Webhook 장애라면 수동 `Build Now`로 우회 가능
-8. 프론트 파일 자체가 잘못된 경우 GitHub에서 수정 commit 후 재배포
+3. Rollback 결과 Slack 수신 여부 확인
+4. Deployment Summary artifact에서 rollback 필드 확인
+5. S3 Console에서 `index.html`, `app.js`, `style.css` object version 상태 확인
+6. CloudFront Console에서 배포 Invalidation ID와 rollback Invalidation ID의 status 확인
+7. `https://mzmt.shop/`, `/app.js`, `/style.css` 응답 확인
+8. 자동 rollback이 `RECOVERY_VERIFIED`이면 서비스 복구 상태로 판단하고 원인 분석 진행
+9. 자동 rollback이 실패했거나 실행되지 않았다면 이전 정상 commit 재배포 또는 S3 VersionId 수동 복구 진행
+10. Webhook 장애라면 수동 `Build Now`로 우회 가능
+11. 프론트 파일 자체가 잘못된 경우 GitHub에서 수정 commit 후 재배포
 
 주의:
 
@@ -540,23 +575,94 @@ Pipeline 실패 시 아래 순서로 대응한다.
 
 ## 8. Rollback 기준
 
-현재 프론트엔드 CI/CD에는 자동 rollback이 없다.
+프론트엔드는 Docker/ECR/ECS 배포가 아니라 S3 정적 파일 업로드와 CloudFront Invalidation 기반 배포이다. ECS Circuit Breaker처럼 기본 제공되는 서비스 revision rollback 버튼은 없으므로, S3 Versioning을 이용해 Pipeline에서 직접 rollback을 수행한다.
 
-프론트엔드는 Docker/ECR/ECS 배포가 아니라 S3 정적 파일 업로드와 CloudFront Invalidation 기반 배포이다. 따라서 API/Worker처럼 ECS Service revision을 baseline으로 되돌리는 자동 rollback 구조가 아니다.
+### 8.1 자동 rollback 실행 조건
+
+자동 rollback은 아래 조건을 모두 만족할 때 실행된다.
+
+- S3 Upload 전에 baseline VersionId capture가 성공함
+- `index.html`, `app.js`, `style.css` 중 하나 이상 S3 업로드 단계가 시작됨
+- 이후 CloudFront Invalidation 또는 Post-Deploy Verification 등 배포 후 단계에서 Pipeline이 실패함
+
+자동 rollback은 별도 승인 없이 실행한다. 이미 잘못된 정적 파일이 S3/CloudFront 경로에 반영됐을 수 있는 상황이므로, 운영자 승인을 기다리지 않고 직전 정상 baseline으로 즉시 복구하는 것이 목적이다.
+
+### 8.2 자동 rollback 동작
+
+Pipeline은 S3 Upload 직전에 세 파일의 최신 VersionId를 저장한다.
+
+```text
+index.html → BASELINE_INDEX_VERSION_ID
+app.js     → BASELINE_APP_VERSION_ID
+style.css  → BASELINE_STYLE_VERSION_ID
+```
+
+배포 후 실패가 발생하면 Jenkins는 저장한 VersionId를 기준으로 S3 `copy-object`를 수행하여 이전 객체 버전을 다시 최신 버전으로 복사한다.
+
+```text
+baseline VersionId
+→ aws s3api copy-object
+→ current object로 재복구
+→ CloudFront rollback invalidation 생성
+→ mzmt.shop / app.js / style.css 재검증
+```
+
+### 8.3 자동 rollback 성공 기준
+
+아래 조건을 모두 만족하면 rollback 성공으로 판단한다.
+
+- `rollback_executed=true`
+- `rollback_result=RECOVERY_VERIFIED`
+- rollback CloudFront Invalidation ID가 존재함
+- rollback Invalidation status가 `Completed`
+- `https://mzmt.shop/` HTTP 200
+- HTML에 `SecureVoiceGuard` 문자열 포함
+- `https://mzmt.shop/app.js` 응답 성공
+- `https://mzmt.shop/style.css` 응답 성공
+
+### 8.4 자동 rollback이 실행되지 않는 경우
+
+아래 경우에는 자동 rollback이 실행되지 않을 수 있다.
+
+- Source Checkout 실패
+- Static File Validation 실패
+- baseline VersionId capture 실패
+- S3 Upload가 시작되기 전 실패
+- Jenkins 자체 장애로 post failure 로직이 실행되지 못함
+
+이 경우에는 AWS 배포 대상이 변경되지 않았거나, baseline이 없어서 안전한 자동 복구 기준이 없는 상태다. 운영자는 실패 stage를 확인하고 원인 해결 후 재실행한다.
+
+### 8.5 자동 rollback 실패 시 수동 복구
+
+자동 rollback이 `ROLLBACK_FAILED` 또는 `ROLLBACK_VERIFICATION_FAILED`이면 아래 순서로 확인한다.
+
+1. Jenkins Console Log에서 rollback 실패 원인 확인
+2. S3 Versioning이 Enabled인지 확인
+3. Jenkins Role에 `s3:ListBucketVersions`, `s3:GetObjectVersion`, `s3:PutObject` 권한이 있는지 확인
+4. CloudFront rollback Invalidation 생성 여부 확인
+5. S3 Console에서 세 파일의 이전 VersionId 확인
+6. 필요 시 이전 정상 commit을 Jenkins에서 재배포
+7. 긴급 상황이면 S3 Console 또는 AWS CLI로 이전 VersionId를 수동 복원하고 CloudFront Invalidation 수행
 
 수동 rollback 예시:
 
-1. 이전 정상 commit으로 revert commit 생성
+1. 이전 정상 commit으로 revert commit 생성 또는 이전 commit SHA checkout
 2. Jenkins Pipeline 재실행
 3. S3에 이전 버전의 `index.html`, `app.js`, `style.css` 재업로드
 4. CloudFront Invalidation 재생성
 5. `https://mzmt.shop` 및 정적 asset 응답 검증
 
+### 8.6 승인 기준
+
+현재 자동 rollback에는 승인 단계를 넣지 않는다.
+
+승인이 필요한 경우는 자동 복구가 아니라 운영자가 특정 과거 commit, 특정 S3 VersionId, 또는 다른 릴리즈로 의도적으로 되돌리는 수동 rollback 작업이다. 이런 경우에는 어떤 버전으로 되돌릴지 판단이 필요하므로 승인이나 변경 이력 기록이 필요하다.
+
 주의:
 
 - `aws s3 sync --delete`를 사용하지 않는다.
 - 현재는 파일 3개만 명시적으로 배포한다.
-- 운영 고도화 시 S3 versioning 또는 배포 artifact 백업 기반 rollback을 검토할 수 있다.
+- 향후 고도화 시 hash 기반 asset 파일명과 `index.html` 단일 rollback 전략을 검토할 수 있다.
 
 ## 9. 보안 및 운영 주의사항
 
@@ -564,6 +670,7 @@ Pipeline 실패 시 아래 순서로 대응한다.
 - Jenkins는 EC2 IAM Role 기반으로 AWS CLI를 실행한다.
 - Jenkins Role: `securevoice-dev-jenkins-role`
 - 프론트 배포용 최소 권한 정책: `securevoice-dev-jenkins-frontend-deploy-policy`
+- S3 Versioning rollback을 위해 `s3:ListBucketVersions`, `s3:GetObjectVersion` 권한이 필요하다.
 - GitHub Webhook Secret은 GitHub Token과 다르다.
 - Slack Webhook URL은 문서에 노출하지 않는다.
 - GitHub token, Webhook Secret, Slack Webhook URL, AWS credential 값은 Runbook에 기록하지 않는다.
@@ -575,4 +682,4 @@ Pipeline 실패 시 아래 순서로 대응한다.
 
 SecureVoiceGuard 프론트엔드 CI/CD는 Docker/ECR/ECS 배포가 아니라 S3 정적 파일 배포와 CloudFront Invalidation 중심으로 구성했다. Jenkins는 GitHub `ktk-cicd` branch push를 Webhook으로 받아 `index.html`, `app.js`, `style.css`를 검증한 뒤 S3 Web Bucket에 명시적으로 업로드하고, CloudFront Invalidation 완료 후 `https://mzmt.shop` 도메인과 정적 asset 응답을 검증한다.
 
-AWS 작업은 Jenkins EC2 IAM Role 기반 최소 권한으로 수행했으며, 성공/실패 결과는 Slack으로 알림을 보낸다. 이번 프론트 CI/CD 검증에서는 Terraform-managed Jenkins 인프라를 변경하지 않았고, 콘솔에서 수동 부여한 프론트 배포 권한은 추후 Terraform 코드로 흡수해 drift를 제거하는 방향으로 정리한다.
+배포 후 검증이 실패하면 Jenkins는 S3 Upload 전에 저장한 세 파일의 baseline VersionId를 기준으로 자동 rollback을 수행하고, rollback CloudFront Invalidation 후 도메인과 asset 응답을 다시 검증한다. AWS 작업은 Jenkins EC2 IAM Role 기반 최소 권한으로 수행했으며, 성공/실패/rollback 결과는 Slack과 Deployment Summary artifact로 남긴다. 이번 프론트 CI/CD 검증에서는 Terraform apply를 수행하지 않았고, 콘솔에서 수동 부여한 프론트 배포 권한은 추후 Terraform 코드로 흡수해 drift를 제거하는 방향으로 정리한다.

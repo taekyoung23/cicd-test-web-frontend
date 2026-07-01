@@ -185,10 +185,28 @@ def verifyFrontendRollback() {
               echo "Frontend post-rollback verification attempt ${attempt}/5"
               rm -f frontend-rollback-index.html frontend-rollback-app.js frontend-rollback-style.css
 
-              if curl --fail --silent --show-error --location "${FRONTEND_URL}/" -o frontend-rollback-index.html && \
+              check_url() {
+                URL="$1"
+                OUTPUT_FILE="$2"
+
+                STATUS=$(curl --silent --show-error --location \
+                  --output "${OUTPUT_FILE}" \
+                  --write-out "%{http_code}" \
+                  "${URL}")
+
+                echo "${URL} HTTP Status: ${STATUS}"
+
+                if [ "${STATUS}" != "200" ]; then
+                  echo "ERROR: ${URL} verification failed with HTTP ${STATUS}"
+                  return 1
+                fi
+              }
+
+              if check_url "${FRONTEND_URL}/" frontend-rollback-index.html && \
                  grep -q 'SecureVoiceGuard' frontend-rollback-index.html && \
-                 curl --fail --silent --show-error --location "${FRONTEND_URL}/app.js" -o frontend-rollback-app.js && \
-                 curl --fail --silent --show-error --location "${FRONTEND_URL}/style.css" -o frontend-rollback-style.css; then
+                 echo "index.html content check: SecureVoiceGuard found" && \
+                 check_url "${FRONTEND_URL}/app.js" frontend-rollback-app.js && \
+                 check_url "${FRONTEND_URL}/style.css" frontend-rollback-style.css; then
                 echo "Frontend post-rollback verification passed."
                 exit 0
               fi
@@ -560,10 +578,28 @@ pipeline {
                       echo "Frontend post-deploy verification attempt ${attempt}/5"
                       rm -f frontend-index.html frontend-app.js frontend-style.css
 
-                      if curl --fail --silent --show-error --location "${FRONTEND_URL}/" -o frontend-index.html && \
+                      check_url() {
+                        URL="$1"
+                        OUTPUT_FILE="$2"
+
+                        STATUS=$(curl --silent --show-error --location \
+                          --output "${OUTPUT_FILE}" \
+                          --write-out "%{http_code}" \
+                          "${URL}")
+
+                        echo "${URL} HTTP Status: ${STATUS}"
+
+                        if [ "${STATUS}" != "200" ]; then
+                          echo "ERROR: ${URL} verification failed with HTTP ${STATUS}"
+                          return 1
+                        fi
+                      }
+
+                      if check_url "${FRONTEND_URL}/" frontend-index.html && \
                          grep -q 'SecureVoiceGuard' frontend-index.html && \
-                         curl --fail --silent --show-error --location "${FRONTEND_URL}/app.js" -o frontend-app.js && \
-                         curl --fail --silent --show-error --location "${FRONTEND_URL}/style.css" -o frontend-style.css; then
+                         echo "index.html content check: SecureVoiceGuard found" && \
+                         check_url "${FRONTEND_URL}/app.js" frontend-app.js && \
+                         check_url "${FRONTEND_URL}/style.css" frontend-style.css; then
                         echo "Frontend post-deploy verification passed."
                         exit 0
                       fi
